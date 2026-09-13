@@ -28,9 +28,22 @@ if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
     readonly C_GREEN=$'\033[32m'
     readonly C_YELLOW=$'\033[33m'
     readonly C_CYAN=$'\033[36m'
+    readonly C_BLUE=$'\033[34m'
+    readonly C_MAGENTA=$'\033[35m'
+    readonly C_INV=$'\033[7m'
 else
     readonly C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+    readonly C_BLUE='' C_MAGENTA='' C_INV=''
 fi
+
+# Colour helpers for table cells.
+# count_color <n>        -> red when > 0, green when 0
+# duration_color <text>  -> red for "forever", plain otherwise
+# Both accept padded input ("      12") so callers can align first.
+count_color()    { local v="${1//[[:space:]]/}"; if [[ $v =~ ^[0-9]+$ ]] && (( v > 0 )); then printf '%s%s%s' "$C_RED$C_BOLD" "$1" "$C_RESET"; else printf '%s%s%s' "$C_GREEN" "$1" "$C_RESET"; fi; }
+duration_color() { local v="${1//[[:space:]]/}"; if [[ $v == forever ]]; then printf '%s%s%s' "$C_RED" "$1" "$C_RESET"; else printf '%s' "$1"; fi; }
+rule()           { printf '%s%s%s\n' "$C_DIM" "$(printf '%.0s─' $(seq 1 "${1:-62}"))" "$C_RESET"; }
+
 
 log_info()  { printf '%s\n' "$*"; }
 log_ok()    { printf '%s✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
@@ -198,6 +211,25 @@ read_log() {
     fi
 }
 
+# Adds colour to fail2ban log lines on stdin: timestamps dim, [jail] cyan,
+# "Ban" red, "Unban"/"Restore Ban" green, Found yellow, WARNING/ERROR red.
+# Passes lines through untouched when colour is off. Unbuffered so it works
+# on a live tail.
+colorize_log() {
+    [[ -n $C_RESET ]] || { cat; return 0; }
+    local line
+    while IFS= read -r line; do
+        line="${line//\[NOTICE\]/$'\e[2m'[NOTICE]$'\e[0m'}"
+        line="$(printf '%s' "$line" | sed -E \
+            -e "s/^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:,]+)/${C_DIM}\\1${C_RESET}/" \
+            -e "s/(\[[a-zA-Z0-9_.-]+\]) (Unban|Restore Ban) /${C_CYAN}\\1${C_RESET} ${C_GREEN}\\2${C_RESET} /" \
+            -e "s/(\[[a-zA-Z0-9_.-]+\]) (Ban) /${C_CYAN}\\1${C_RESET} ${C_RED}${C_BOLD}\\2${C_RESET} /" \
+            -e "s/(\[[a-zA-Z0-9_.-]+\]) (Found) /${C_CYAN}\\1${C_RESET} ${C_YELLOW}\\2${C_RESET} /" \
+            -e "s/ (WARNING|ERROR|CRITICAL) / ${C_RED}\\1${C_RESET} /")"
+        printf '%s\n' "$line"
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -206,8 +238,8 @@ cmd_jails() {
     require_fail2ban
     local jail bantime maxretry findtime total=0 count
     heading "Jails"
-    printf '%-22s %8s %10s %9s %9s\n' "JAIL" "BANNED" "BANTIME" "FINDTIME" "MAXRETRY"
-    printf '%s\n' "$(printf '%.0s-' {1..62})"
+    printf '%s%-22s %8s %10s %9s %9s%s\n' "$C_BOLD$C_DIM" "JAIL" "BANNED" "BANTIME" "FINDTIME" "MAXRETRY" "$C_RESET"
+    rule 62
     while IFS= read -r jail; do
         [[ -n $jail ]] || continue
         count="$(get_banned "$jail" | wc -l | tr -d ' ')"
@@ -215,11 +247,16 @@ cmd_jails() {
         findtime="$(fmt_duration "$(jail_prop "$jail" findtime)")"
         maxretry="$(jail_prop "$jail" maxretry)"
         total=$(( total + count ))
-        printf '%-22s %8s %10s %9s %9s\n' \
-            "$jail" "$count" "${bantime:-?}" "${findtime:-?}" "${maxretry:-?}"
+        # Colour codes have zero width, so pad the plain text first.
+        printf '%s%-22s%s %s %s %s %9s\n' \
+            "$C_CYAN" "$jail" "$C_RESET" \
+            "$(count_color "$(printf '%8s' "$count")")" \
+            "$(duration_color "$(printf '%10s' "${bantime:-?}")")" \
+            "$(duration_color "$(printf '%9s' "${findtime:-?}")")" \
+            "${maxretry:-?}"
     done < <(get_jails)
-    printf '%s\n' "$(printf '%.0s-' {1..62})"
-    printf '%-22s %8s\n' "TOTAL" "$total"
+    rule 62
+    printf '%s%-22s%s %s\n' "$C_BOLD" "TOTAL" "$C_RESET" "$(count_color "$(printf '%8s' "$total")")"
 }
 
 cmd_list() {
@@ -244,7 +281,7 @@ cmd_list() {
             continue
         fi
         for ip in "${_ips[@]}"; do
-            printf '  %s\n' "$ip"
+            printf '  %s●%s %s\n' "$C_RED" "$C_RESET" "$ip"
         done
     done < <(get_jails)
 
@@ -351,7 +388,7 @@ cmd_unban_all() {
         while IFS= read -r ip; do
             [[ -n $ip ]] || continue
             if fail2ban-client set "$jail" unbanip "$ip" >/dev/null 2>&1; then
-                printf '  unbanned %s from %s\n' "$ip" "$jail"
+                printf '  %s✔%s unbanned %s from %s%s%s\n' "$C_GREEN" "$C_RESET" "$ip" "$C_CYAN" "$jail" "$C_RESET"
             else
                 log_warn "  failed: $ip in $jail"
             fi
@@ -371,7 +408,7 @@ cmd_check() {
     while IFS= read -r jail; do
         [[ -n $jail ]] || continue
         if get_banned "$jail" | grep -qxF "$ip"; then
-            printf '  %sBANNED%s in %s\n' "$C_RED" "$C_RESET" "$jail"
+            printf '  %sBANNED%s in %s%s%s\n' "$C_RED$C_BOLD" "$C_RESET" "$C_CYAN" "$jail" "$C_RESET"
             hits=$(( hits + 1 ))
         fi
     done < <(get_jails)
@@ -382,7 +419,7 @@ cmd_check() {
     local matches
     matches="$(read_log 0 | grep -F -- "$ip" | tail -20 || true)"
     if [[ -n $matches ]]; then
-        printf '%s\n' "$matches" | sed 's/^/  /'
+        printf '%s\n' "$matches" | colorize_log | sed 's/^/  /'
     else
         printf '  %sno log entries found%s\n' "$C_DIM" "$C_RESET"
     fi
@@ -404,10 +441,14 @@ cmd_top() {
         printf '  %sno ban events found in the log%s\n' "$C_DIM" "$C_RESET"
         return 0
     fi
-    printf '%8s  %s\n' "BANS" "IP"
+    printf '%s%8s  %s%s\n' "$C_BOLD$C_DIM" "BANS" "IP" "$C_RESET"
     # Explicit IFS: the global IFS excludes spaces, which would break splitting.
+    local color
     printf '%s\n' "$out" | while IFS=' ' read -r count ip; do
-        printf '%8s  %s\n' "$count" "$ip"
+        if (( count >= 10 )); then color="$C_RED$C_BOLD"
+        elif (( count >= 3 )); then color="$C_YELLOW"
+        else color=""; fi
+        printf '%s%8s%s  %s\n' "$color" "$count" "$C_RESET" "$ip"
     done
 }
 
@@ -419,6 +460,7 @@ cmd_recent() {
     read_log 0 \
         | grep -E '\] (Ban|Unban) ' \
         | tail -n "$n" \
+        | colorize_log \
         | sed 's/^/  /' || printf '  %snone%s\n' "$C_DIM" "$C_RESET"
 }
 
@@ -428,9 +470,9 @@ cmd_watch() {
     local src
     src="$(resolve_logfile)"
     if [[ $src == "journal" ]]; then
-        journalctl -u fail2ban -f --no-pager
+        journalctl -u fail2ban -f --no-pager | colorize_log
     else
-        tail -f "$src"
+        tail -f "$src" | colorize_log
     fi
 }
 
@@ -497,7 +539,8 @@ cmd_unwhitelist() {
 cmd_whitelist_show() {
     if [[ -f $IGNORE_DROPIN ]]; then
         heading "Managed whitelist ($IGNORE_DROPIN)"
-        grep '^ignoreip' "$IGNORE_DROPIN" | sed 's/^ignoreip = //' | tr ' ' '\n' | sed 's/^/  /'
+        grep '^ignoreip' "$IGNORE_DROPIN" | sed 's/^ignoreip = //' | tr ' ' '\n' \
+            | sed "s/^/  ${C_GREEN}✔${C_RESET} /"
     else
         log_info "no managed whitelist file yet"
     fi
@@ -505,7 +548,7 @@ cmd_whitelist_show() {
     local jail
     while IFS= read -r jail; do
         [[ -n $jail ]] || continue
-        printf '  %-20s %s\n' "$jail" "$(jail_prop "$jail" ignoreip)"
+        printf '  %s%-20s%s %s%s%s\n' "$C_CYAN" "$jail" "$C_RESET" "$C_DIM" "$(jail_prop "$jail" ignoreip)" "$C_RESET"
     done < <(get_jails)
 }
 
@@ -552,10 +595,10 @@ cmd_status() {
     require_fail2ban
     heading "Service"
     systemctl is-active fail2ban >/dev/null 2>&1 \
-        && printf '  fail2ban: %sactive%s\n' "$C_GREEN" "$C_RESET" \
-        || printf '  fail2ban: %sinactive%s\n' "$C_RED" "$C_RESET"
-    printf '  version : %s\n' "$(fail2ban-client version 2>/dev/null || echo unknown)"
-    printf '  logtarget: %s\n' "$(resolve_logfile)"
+        && printf '  %-10s %s● active%s\n' "fail2ban" "$C_GREEN$C_BOLD" "$C_RESET" \
+        || printf '  %-10s %s● inactive%s\n' "fail2ban" "$C_RED$C_BOLD" "$C_RESET"
+    printf '  %-10s %s\n' "version" "$(fail2ban-client version 2>/dev/null || echo unknown)"
+    printf '  %-10s %s%s%s\n' "logtarget" "$C_DIM" "$(resolve_logfile)" "$C_RESET"
     cmd_jails
 }
 
@@ -580,9 +623,6 @@ TUI_RESIZED=0
 TUI_COLS=80
 TUI_ROWS=24
 TUI_JAIL=""
-
-C_INV=$'\033[7m'
-[[ -n $C_RESET ]] || C_INV=''
 
 tput_q() { tput "$@" 2>/dev/null || true; }
 
@@ -1021,38 +1061,38 @@ usage() {
     cat <<EOF
 ${C_BOLD}$PROG${C_RESET} v$VERSION - friendlier fail2ban management
 
-${C_BOLD}VIEWING${C_RESET}
-  status                    Service state plus per-jail summary table
-  jails                     Jail table: banned count, bantime, findtime, maxretry
-  list [jail]               Banned IPs grouped by jail (all jails if omitted)
-  check <ip>                Is this IP banned, and what does the log say
-  recent [n]                Last n ban/unban events (default 25)
-  top [n]                   Most-banned IPs all time (default 15)
-  watch                     Follow fail2ban activity live
-  export                    Dump all bans as JSON (for central collection)
+${C_BOLD}${C_CYAN}VIEWING${C_RESET}
+  ${C_GREEN}status${C_RESET}                    Service state plus per-jail summary table
+  ${C_GREEN}jails${C_RESET}                     Jail table: banned count, bantime, findtime, maxretry
+  ${C_GREEN}list${C_RESET} [jail]               Banned IPs grouped by jail (all jails if omitted)
+  ${C_GREEN}check${C_RESET} <ip>                Is this IP banned, and what does the log say
+  ${C_GREEN}recent${C_RESET} [n]                Last n ban/unban events (default 25)
+  ${C_GREEN}top${C_RESET} [n]                   Most-banned IPs all time (default 15)
+  ${C_GREEN}watch${C_RESET}                     Follow fail2ban activity live
+  ${C_GREEN}export${C_RESET}                    Dump all bans as JSON (for central collection)
 
-${C_BOLD}ACTIONS${C_RESET}                                            ${C_DIM}(need root)${C_RESET}
-  ban <ip> [jail ...]       Ban an IP. No jail given = every jail
-  unban <ip> [jail ...]     Unban an IP. No jail given = every jail
-  unban-all [jail]          Flush all bans, with confirmation
-  reload                    Reload fail2ban config
+${C_BOLD}${C_CYAN}ACTIONS${C_RESET}                                            ${C_DIM}(need root)${C_RESET}
+  ${C_GREEN}ban${C_RESET} <ip> [jail ...]       Ban an IP. No jail given = every jail
+  ${C_GREEN}unban${C_RESET} <ip> [jail ...]     Unban an IP. No jail given = every jail
+  ${C_GREEN}unban-all${C_RESET} [jail]          Flush all bans, with confirmation
+  ${C_GREEN}reload${C_RESET}                    Reload fail2ban config
 
-${C_BOLD}WHITELIST${C_RESET}                                          ${C_DIM}(need root)${C_RESET}
-  whitelist <ip|cidr>       Add to managed ignoreip drop-in and unban now
-  unwhitelist <ip|cidr>     Remove from the managed drop-in
-  whitelist-show            Show managed and effective ignoreip
+${C_BOLD}${C_CYAN}WHITELIST${C_RESET}                                          ${C_DIM}(need root)${C_RESET}
+  ${C_GREEN}whitelist${C_RESET} <ip|cidr>       Add to managed ignoreip drop-in and unban now
+  ${C_GREEN}unwhitelist${C_RESET} <ip|cidr>     Remove from the managed drop-in
+  ${C_GREEN}whitelist-show${C_RESET}            Show managed and effective ignoreip
 
-${C_BOLD}OTHER${C_RESET}
-  test <logfile> <filter>   Dry-run a filter with fail2ban-regex
-  menu | tui                Interactive terminal UI (default with no args)
-  help                      This text (default when not on a terminal)
+${C_BOLD}${C_CYAN}OTHER${C_RESET}
+  ${C_GREEN}test${C_RESET} <logfile> <filter>   Dry-run a filter with fail2ban-regex
+  ${C_GREEN}menu | tui${C_RESET}                Interactive terminal UI (default with no args)
+  ${C_GREEN}help${C_RESET}                      This text (default when not on a terminal)
 
-${C_BOLD}EXAMPLES${C_RESET}
-  $PROG list sshd
-  $PROG ban 203.0.113.9 sshd nginx-limit-req
-  $PROG unban 203.0.113.9
-  $PROG whitelist 10.10.0.0/16
-  $PROG export > /var/backups/f2b-\$(date +%F).json
+${C_BOLD}${C_CYAN}EXAMPLES${C_RESET}
+  ${C_DIM}$PROG list sshd${C_RESET}
+  ${C_DIM}$PROG ban 203.0.113.9 sshd nginx-limit-req${C_RESET}
+  ${C_DIM}$PROG unban 203.0.113.9${C_RESET}
+  ${C_DIM}$PROG whitelist 10.10.0.0/16${C_RESET}
+  ${C_DIM}$PROG export > /var/backups/f2b-\$(date +%F).json${C_RESET}
 EOF
 }
 
