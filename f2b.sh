@@ -75,6 +75,10 @@ require_fail2ban() {
         || die "fail2ban-client not found in PATH"
     fail2ban-client ping >/dev/null 2>&1 \
         || die "fail2ban server is not responding. Check: systemctl status fail2ban"
+    # Take the snapshot here, in the parent shell, so every later reader
+    # (including those in subshells) is served from memory.
+    (( CACHE_LOADED )) || load_cache
+    (( PROPS_LOADED )) || load_props
 }
 
 # ---------------------------------------------------------------------------
@@ -109,13 +113,84 @@ assert_ip() {
 # fail2ban introspection
 # ---------------------------------------------------------------------------
 
-# Prints one jail name per line.
-get_jails() {
-    fail2ban-client status 2>/dev/null \
+# Every fail2ban-client call starts a Python interpreter, so a screen that
+# asks four questions per jail gets slow fast. Instead, one snapshot per
+# command run is taken with two calls (`status` for the jail list and
+# `banned` for every jail's ban list at once) and served from these caches.
+# Anything that changes bans calls invalidate_cache.
+declare -A BANNED_BY_JAIL=()   # jail -> newline-separated IPs
+declare -A JAIL_PROPS=()       # "jail/prop" -> value, from `fail2ban-client -d`
+JAILS_CACHE=""
+CACHE_LOADED=0
+PROPS_LOADED=0
+
+# Marks the snapshot stale. The next reader reloads it; call refresh_cache
+# instead when the reader will run in a subshell (which cannot update the
+# parent's copy).
+invalidate_cache() { CACHE_LOADED=0; }
+refresh_cache()    { load_cache; }
+
+# Keep the snapshot in step with a ban/unban we just issued, without asking
+# the server again.
+cache_add_ban() {
+    local jail="$1" ip="$2" cur="${BANNED_BY_JAIL[$jail]:-}"
+    BANNED_BY_JAIL[$jail]="${cur:+$cur$'\n'}$ip"
+}
+cache_remove_ban() {
+    local jail="$1" ip="$2" cur="${BANNED_BY_JAIL[$jail]:-}" out="" line
+    while IFS= read -r line; do
+        [[ $line == "$ip" || -z $line ]] || out+="${out:+$'\n'}$line"
+    done <<< "$cur"
+    BANNED_BY_JAIL[$jail]="$out"
+}
+
+load_cache() {
+    CACHE_LOADED=1
+    BANNED_BY_JAIL=()
+    JAILS_CACHE="$(fail2ban-client status 2>/dev/null \
         | sed -n 's/^.*Jail list:[[:space:]]*//p' \
         | tr ',' '\n' \
         | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-        | grep -v '^$' || true
+        | grep -v '^$' || true)"
+    [[ -n $JAILS_CACHE ]] || return 0
+
+    # `banned` (fail2ban >= 0.10.6) prints [{'sshd': ['1.2.3.4']}, {'nginx': []}]
+    local out entry jail ips
+    out="$(fail2ban-client banned 2>/dev/null || true)"
+    if [[ $out == \[* ]]; then
+        while IFS= read -r entry; do
+            [[ $entry == *:* ]] || continue
+            jail="${entry#*\{\'}"; jail="${jail%%\'*}"
+            ips="$(printf '%s' "${entry#*: }" | grep -oE "'[^']+'" | tr -d "'" || true)"
+            BANNED_BY_JAIL[$jail]="$ips"
+        done < <(printf '%s\n' "$out" | sed 's/}, {/}\n{/g')
+    else
+        # Older server: one status call per jail.
+        while IFS= read -r jail; do
+            [[ -n $jail ]] || continue
+            BANNED_BY_JAIL[$jail]="$(fail2ban-client status "$jail" 2>/dev/null \
+                | sed -n 's/^.*Banned IP list:[[:space:]]*//p' \
+                | tr ' ' '\n' | grep -v '^$' || true)"
+        done <<< "$JAILS_CACHE"
+    fi
+}
+
+# Jail settings come from the client-side config dump, which needs no server
+# round-trip and returns every jail in one go. Lines look like
+#   ['set', 'sshd', 'bantime', '10m']
+load_props() {
+    PROPS_LOADED=1
+    local line re="^\['set', '([^']+)', '(bantime|findtime|maxretry)', '?([^]']+)'?\]$"
+    while IFS= read -r line; do
+        [[ $line =~ $re ]] || continue
+        JAIL_PROPS["${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"]="${BASH_REMATCH[3]}"
+    done < <(fail2ban-client -d 2>/dev/null || true)
+}
+
+# Prints one jail name per line.
+get_jails() {
+    (( CACHE_LOADED )) || load_cache
+    [[ -z $JAILS_CACHE ]] || printf '%s\n' "$JAILS_CACHE"
 }
 
 jail_exists() {
@@ -131,15 +206,32 @@ assert_jail() {
 # Prints one banned IP per line for the given jail.
 get_banned() {
     local jail="$1"
-    fail2ban-client status "$jail" 2>/dev/null \
-        | sed -n 's/^.*Banned IP list:[[:space:]]*//p' \
-        | tr ' ' '\n' \
-        | grep -v '^$' || true
+    (( CACHE_LOADED )) || load_cache
+    [[ -z ${BANNED_BY_JAIL[$jail]:-} ]] || printf '%s\n' "${BANNED_BY_JAIL[$jail]}"
 }
 
-# Reads a single numeric/string property from a jail, empty on failure.
+# Number of banned addresses in a jail, without forking.
+banned_count() {
+    local jail="$1" v
+    (( CACHE_LOADED )) || load_cache
+    v="${BANNED_BY_JAIL[$jail]:-}"
+    [[ -n $v ]] || { printf '0'; return 0; }
+    v="${v//[!$'\n']/}"
+    printf '%d' "$(( ${#v} + 1 ))"
+}
+
+# Reads a single property from a jail. bantime/findtime/maxretry come from the
+# cached config dump; anything else (or a cache miss) asks the server.
 jail_prop() {
     local jail="$1" prop="$2"
+    case "$prop" in
+        bantime|findtime|maxretry)
+            (( PROPS_LOADED )) || load_props
+            if [[ -n ${JAIL_PROPS[$jail/$prop]:-} ]]; then
+                printf '%s\n' "${JAIL_PROPS[$jail/$prop]}"
+                return 0
+            fi ;;
+    esac
     fail2ban-client get "$jail" "$prop" 2>/dev/null | tail -1 || true
 }
 
@@ -150,6 +242,16 @@ jail_prop() {
 #   negative   -> "forever"     non-numeric -> passed through
 fmt_duration() {
     local sec="${1:-}" h m r
+    # Config values may carry a unit suffix ("10m", "1h", "1w"); normalise.
+    if [[ $sec =~ ^([0-9]+)([smhdw])$ ]]; then
+        case "${BASH_REMATCH[2]}" in
+            s) sec=${BASH_REMATCH[1]} ;;
+            m) sec=$(( BASH_REMATCH[1] * 60 )) ;;
+            h) sec=$(( BASH_REMATCH[1] * 3600 )) ;;
+            d) sec=$(( BASH_REMATCH[1] * 86400 )) ;;
+            w) sec=$(( BASH_REMATCH[1] * 604800 )) ;;
+        esac
+    fi
     [[ $sec =~ ^-?[0-9]+$ ]] || { printf '%s\n' "${sec:-?}"; return 0; }
     if (( sec < 0 )); then
         printf 'forever\n'
@@ -217,17 +319,14 @@ read_log() {
 # on a live tail.
 colorize_log() {
     [[ -n $C_RESET ]] || { cat; return 0; }
-    local line
-    while IFS= read -r line; do
-        line="${line//\[NOTICE\]/$'\e[2m'[NOTICE]$'\e[0m'}"
-        line="$(printf '%s' "$line" | sed -E \
-            -e "s/^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:,]+)/${C_DIM}\\1${C_RESET}/" \
-            -e "s/(\[[a-zA-Z0-9_.-]+\]) (Unban|Restore Ban) /${C_CYAN}\\1${C_RESET} ${C_GREEN}\\2${C_RESET} /" \
-            -e "s/(\[[a-zA-Z0-9_.-]+\]) (Ban) /${C_CYAN}\\1${C_RESET} ${C_RED}${C_BOLD}\\2${C_RESET} /" \
-            -e "s/(\[[a-zA-Z0-9_.-]+\]) (Found) /${C_CYAN}\\1${C_RESET} ${C_YELLOW}\\2${C_RESET} /" \
-            -e "s/ (WARNING|ERROR|CRITICAL) / ${C_RED}\\1${C_RESET} /")"
-        printf '%s\n' "$line"
-    done
+    # -u: flush per line so `watch` shows events as they happen.
+    sed -u -E \
+        -e "s/^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:,]+)/${C_DIM}\\1${C_RESET}/" \
+        -e "s/ NOTICE / ${C_DIM}NOTICE${C_RESET} /" \
+        -e "s/(\[[a-zA-Z0-9_.-]+\]) (Unban|Restore Ban) /${C_CYAN}\\1${C_RESET} ${C_GREEN}\\2${C_RESET} /" \
+        -e "s/(\[[a-zA-Z0-9_.-]+\]) (Ban) /${C_CYAN}\\1${C_RESET} ${C_RED}${C_BOLD}\\2${C_RESET} /" \
+        -e "s/(\[[a-zA-Z0-9_.-]+\]) (Found) /${C_CYAN}\\1${C_RESET} ${C_YELLOW}\\2${C_RESET} /" \
+        -e "s/ (WARNING|ERROR|CRITICAL) / ${C_RED}\\1${C_RESET} /"
 }
 
 # ---------------------------------------------------------------------------
@@ -242,7 +341,7 @@ cmd_jails() {
     rule 62
     while IFS= read -r jail; do
         [[ -n $jail ]] || continue
-        count="$(get_banned "$jail" | wc -l | tr -d ' ')"
+        count="$(banned_count "$jail")"
         bantime="$(fmt_duration "$(jail_prop "$jail" bantime)")"
         findtime="$(fmt_duration "$(jail_prop "$jail" findtime)")"
         maxretry="$(jail_prop "$jail" maxretry)"
@@ -311,6 +410,7 @@ cmd_ban() {
     local jail rc=0
     for jail in "${targets[@]}"; do
         if fail2ban-client set "$jail" banip "$ip" >/dev/null 2>&1; then
+            cache_add_ban "$jail" "$ip"
             log_ok "banned $ip in $jail"
         else
             log_warn "failed to ban $ip in $jail (already banned?)"
@@ -343,6 +443,7 @@ cmd_unban() {
     for jail in "${targets[@]}"; do
         if get_banned "$jail" | grep -qxF "$ip"; then
             if fail2ban-client set "$jail" unbanip "$ip" >/dev/null 2>&1; then
+                cache_remove_ban "$jail" "$ip"
                 log_ok "unbanned $ip from $jail"
                 found=1
             else
@@ -373,7 +474,7 @@ cmd_unban_all() {
 
     local total=0 jail
     for jail in "${targets[@]}"; do
-        total=$(( total + $(get_banned "$jail" | wc -l | tr -d ' ') ))
+        total=$(( total + $(banned_count "$jail") ))
     done
 
     (( total > 0 )) || { log_info "nothing to unban"; return 0; }
@@ -394,6 +495,7 @@ cmd_unban_all() {
             fi
         done < <(get_banned "$jail")
     done
+    refresh_cache
     log_ok "done"
 }
 
@@ -656,6 +758,10 @@ rep() { local s="$1" n="$2" out=""; while (( n-- > 0 )); do out+="$s"; done; pri
 # Truncates $1 to $2 visible characters (input must be free of escapes).
 clip() { local s="$1" w="$2"; (( ${#s} > w )) && s="${s:0:w-1}…"; printf '%s' "$s"; }
 
+# Fork-free variants for hot loops: store into the variable named by $1.
+rep_v()  { local -n __o="$1"; local s="$2" n="$3"; __o=""; while (( n-- > 0 )); do __o+="$s"; done; }
+clip_v() { local -n __o="$1"; __o="$2"; (( ${#__o} > $3 )) && __o="${__o:0:$3-1}…"; return 0; }
+
 # Reads one keypress into TUI_KEY as a symbolic name. Returns 1 on EOF and 2
 # on timeout; the timeout lets menus notice a terminal resize without a key.
 tui_key() {
@@ -692,6 +798,7 @@ tui_key() {
 # because it talks to fail2ban.
 tui_refresh_header() {
     local svc svc_plain jail n jails=0 banned=0 who who_plain summary="" inner line1 line2 line3 pad
+    refresh_cache
     tui_size
     inner=$(( TUI_COLS - 4 ))
 
@@ -709,7 +816,7 @@ tui_refresh_header() {
 
     while IFS= read -r jail; do
         [[ -n $jail ]] || continue
-        n="$(get_banned "$jail" | wc -l | tr -d ' ')"
+        n="$(banned_count "$jail")"
         jails=$(( jails + 1 )); banned=$(( banned + n ))
         summary+="${summary:+  }${jail} ${n}"
     done < <(get_jails)
@@ -766,7 +873,7 @@ tui_hints() {
 tui_menu() {
     local title="$1"; shift
     local -a items=("$@") sel=() labels=() descs=()
-    local i n=0 labelw=0 cur=${TUI_CURSOR:-0} top=0 row vis key num lab desc line plain width
+    local i n=0 labelw=0 cur=${TUI_CURSOR:-0} top=0 row vis key num lab desc plain width pad
 
     for i in "${!items[@]}"; do
         if [[ ${items[i]} == '#'* ]]; then
@@ -804,21 +911,25 @@ tui_menu() {
         for (( i = top; i < ${#items[@]} && i < top + vis; i++ )); do
             if [[ ${items[i]} == '#'* ]]; then
                 if [[ -z ${labels[i]} ]]; then
-                    printf ' %s%s%s\n' "$C_DIM" "$(rep '─' $(( width - 2 )))" "$C_RESET"
+                    rep_v pad '─' $(( width - 2 ))
+                    printf ' %s%s%s\n' "$C_DIM" "$pad" "$C_RESET"
                 else
-                    printf ' %s%s %s%s\n' "$C_DIM" "$(clip "${labels[i]}" $(( width - 6 )))" \
-                        "$(rep '─' $(( width - ${#labels[i]} - 3 > 0 ? width - ${#labels[i]} - 3 : 0 )))" "$C_RESET"
+                    clip_v lab "${labels[i]}" $(( width - 6 ))
+                    rep_v pad '─' $(( width - ${#lab} - 3 > 0 ? width - ${#lab} - 3 : 0 ))
+                    printf ' %s%s %s%s\n' "$C_DIM" "$lab" "$pad" "$C_RESET"
                 fi
                 continue
             fi
             # selectable index of this row
             num=""; for (( key = 0; key < n; key++ )); do (( sel[key] == i )) && { num=$(( key + 1 )); break; }; done
-            lab="$(clip "${labels[i]}" "$labelw")"
-            desc="$(clip "${descs[i]}" $(( width - labelw - 8 > 0 ? width - labelw - 8 : 0 )))"
-            printf -v plain '  %s  %-*s  %s' "$( (( num <= 9 )) && printf '%d' "$num" || printf ' ' )" "$labelw" "$lab" "$desc"
-            plain="$(clip "$plain" "$width")"
+            (( num <= 9 )) || num=" "
+            clip_v lab "${labels[i]}" "$labelw"
+            clip_v desc "${descs[i]}" $(( width - labelw - 8 > 0 ? width - labelw - 8 : 0 ))
+            printf -v plain '  %s  %-*s  %s' "$num" "$labelw" "$lab" "$desc"
+            clip_v plain "$plain" "$width"
             if (( i == sel[cur] )); then
-                printf ' %s%s%s%s%s\n' "$C_INV$C_BOLD" "❯" "${plain:1}" "$(rep ' ' $(( width - ${#plain} - 1 )))" "$C_RESET"
+                rep_v pad ' ' $(( width - ${#plain} - 1 ))
+                printf ' %s%s%s%s%s\n' "$C_INV$C_BOLD" "❯" "${plain:1}" "$pad" "$C_RESET"
             else
                 printf ' %s%s%s%-*s  %s%s%s\n' "$C_DIM" "${plain:2:1}" "$C_RESET  " "$labelw" "$lab" "$C_DIM" "$desc" "$C_RESET"
             fi
@@ -878,6 +989,7 @@ tui_run() {
     trap ':' INT
     ( "$@" ) || true
     trap 'tui_leave; exit 130' INT
+    refresh_cache   # the action ran in a subshell; assume it changed bans
     tput_q civis
     printf '\n%s%s%s\n' "$C_DIM" "$(rep '─' "$TUI_COLS")" "$C_RESET"
     tui_hints "any key" "back to menu"
@@ -899,7 +1011,7 @@ tui_pick_jail() {
     mapfile -t jails < <(get_jails)
     (( ${#jails[@]} )) || { tui_run "$title" log_warn "no jails configured"; return 1; }
     for jail in "${jails[@]}"; do
-        count="$(get_banned "$jail" | wc -l | tr -d ' ')"
+        count="$(banned_count "$jail")"
         total=$(( total + count ))
         labels+=("${jail}"$'\t'"${count} banned   bantime $(fmt_duration "$(jail_prop "$jail" bantime)")")
     done
