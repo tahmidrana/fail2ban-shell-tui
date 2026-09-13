@@ -1,0 +1,5 @@
+[2026-09-13 10:15:22] production.WARNING: Failed login for bob@example.com from 203.0.113.9
+[2026-09-13 10:15:25] production.WARNING: Failed login for bob@example.com from 203.0.113.9
+[2026-09-13 10:15:30] production.WARNING: Failed login from 2001:db8::7
+[2026-09-13 10:16:00] production.INFO: User logged in {"id":4}
+[2026-09-13 10:16:05] production.ERROR: Something broke from 203.0.113.99 (not a login line)

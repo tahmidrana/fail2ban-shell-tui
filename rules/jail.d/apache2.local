@@ -1,0 +1,48 @@
+# apache2.local - Apache HTTP server jails, all on stock filters.
+# Log paths use globs so per-vhost logs (e.g. example.com-access.log) are
+# picked up automatically.
+
+# HTTP basic-auth failures (401 repeated).
+[apache-auth]
+enabled  = true
+port     = http,https
+logpath  = /var/log/apache2/*error.log
+maxretry = 5
+
+# Known bad user agents (scrapers, exploit kits).
+[apache-badbots]
+enabled  = true
+port     = http,https
+logpath  = /var/log/apache2/*access.log
+maxretry = 2
+bantime  = 1d
+
+# Requests for scripts that don't exist on your site (.php/.asp/.cgi probes).
+# Disable this on a PHP site where 404s for .php files are legitimate.
+[apache-noscript]
+enabled  = true
+port     = http,https
+logpath  = /var/log/apache2/*error.log
+maxretry = 6
+
+# Buffer-overflow style URLs.
+[apache-overflows]
+enabled  = true
+port     = http,https
+logpath  = /var/log/apache2/*error.log
+maxretry = 2
+
+# Probing for phpMyAdmin, setup scripts, etc.
+[apache-botsearch]
+enabled  = true
+port     = http,https
+logpath  = /var/log/apache2/*error.log
+maxretry = 2
+
+# Clients pretending to be Googlebot from non-Google addresses (does a DNS
+# lookup per hit; keep maxretry low and leave disabled on very busy hosts).
+[apache-fakegooglebot]
+enabled  = false
+port     = http,https
+logpath  = /var/log/apache2/*access.log
+maxretry = 1

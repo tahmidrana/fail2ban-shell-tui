@@ -1,0 +1,16 @@
+# sshd.local - brute force and invalid user attempts against OpenSSH.
+# Uses the stock sshd filter. Reads the journal on systemd hosts.
+
+[sshd]
+enabled  = true
+port     = ssh
+# "aggressive" also catches pre-auth disconnects, key-only failures and
+# "no matching key exchange" noise from scanners. Use "normal" if too strict.
+mode     = aggressive
+backend  = systemd
+maxretry = 4
+findtime = 10m
+bantime  = 2h
+
+# If sshd logs to a file instead of the journal, comment out backend above and:
+# logpath = %(sshd_log)s

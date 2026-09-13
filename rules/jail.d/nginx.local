@@ -1,0 +1,33 @@
+# nginx.local - nginx jails, all on stock filters.
+
+# HTTP basic-auth failures.
+[nginx-http-auth]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/error.log
+maxretry = 5
+
+# Probing for phpMyAdmin, setup scripts, etc. (404s in the access log).
+[nginx-botsearch]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*access.log
+maxretry = 2
+
+# Clients hitting a limit_req zone. Requires limit_req in nginx.conf, e.g.
+#   limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+#   location = /login { limit_req zone=login burst=5 nodelay; ... }
+# nginx logs "limiting requests, excess: ..." to error.log when tripped.
+[nginx-limit-req]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/error.log
+maxretry = 10
+findtime = 1m
+
+# Malformed requests (HTTP 400) - typical of scanners and TLS-on-plain-port.
+[nginx-bad-request]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*access.log
+maxretry = 5

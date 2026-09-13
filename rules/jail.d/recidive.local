@@ -1,0 +1,13 @@
+# recidive.local - repeat offenders. Reads fail2ban's own log and hands out
+# a long ban to any IP that was banned by other jails 3 times in a day.
+
+[recidive]
+enabled  = true
+logpath  = /var/log/fail2ban.log
+# On hosts where fail2ban logs to the journal, use instead:
+# backend = systemd
+# journalmatch = _SYSTEMD_UNIT=fail2ban.service
+banaction = %(banaction_allports)s
+bantime   = 2w
+findtime  = 1d
+maxretry  = 3

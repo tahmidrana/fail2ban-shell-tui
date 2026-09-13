@@ -1,0 +1,30 @@
+# laravel.local - Laravel application login failures.
+#
+# Laravel does not log failed logins out of the box, so this needs a
+# five-line listener in your app (see rules/README.md, "Laravel"). Once the
+# app writes
+#     [2026-09-13 10:15:22] production.WARNING: Failed login for bob@example.com from 203.0.113.9
+# this jail bans the address.
+
+[laravel-auth]
+enabled  = true
+port     = http,https
+filter   = f2b-laravel-auth
+# Adjust to your deploy path(s). Daily log files are matched by the glob.
+logpath  = /var/www/*/storage/logs/laravel*.log
+maxretry = 5
+findtime = 10m
+bantime  = 6h
+
+# Fallback that needs no app changes: POST /login answered with 422/401/429
+# in the web server access log. 302 is ambiguous (success and failure both
+# redirect on classic Blade apps), so this only catches JSON/Inertia apps
+# and rate-limited hits. Enable if you cannot add the listener.
+[laravel-login-http]
+enabled  = false
+port     = http,https
+filter   = f2b-laravel-login-http
+logpath  = /var/log/nginx/*access.log
+           /var/log/apache2/*access.log
+maxretry = 6
+findtime = 10m

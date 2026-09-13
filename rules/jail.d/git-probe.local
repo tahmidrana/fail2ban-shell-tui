@@ -1,0 +1,13 @@
+# git-probe.local - requests for exposed VCS metadata (.git/, .svn/, .hg/).
+# Nobody legitimate asks for /.git/config; one hit is a scanner. Your web
+# server should also deny these paths (see README), this bans the source.
+
+[git-probe]
+enabled  = true
+port     = http,https
+filter   = f2b-git-probe
+logpath  = /var/log/nginx/*access.log
+           /var/log/apache2/*access.log
+maxretry = 1
+findtime = 1d
+bantime  = 1d

@@ -1,0 +1,36 @@
+# 00-f2b-defaults.local - global defaults shared by every jail in this set.
+# Install to /etc/fail2ban/jail.d/. Edit ignoreip before enabling anything.
+#
+# Files in jail.d/ are read in alphabetical order after jail.conf and
+# jail.local, so this file is applied first and the per-service files can
+# override any value.
+
+[DEFAULT]
+# Never ban these. Add your office / VPN / monitoring addresses here.
+# `f2b whitelist <ip>` appends to a separate drop-in, so this list stays clean.
+ignoreip = 127.0.0.1/8 ::1
+
+# Ban for 1 hour on the first offence ...
+bantime  = 1h
+# ... and double it each time the same IP comes back, up to one week.
+bantime.increment = true
+bantime.factor    = 2
+bantime.maxtime   = 1w
+
+# An IP is banned after `maxretry` failures within `findtime`.
+findtime = 10m
+maxretry = 5
+
+# "auto" picks pyinotify/gamin if available, otherwise polling. Use
+# "systemd" for jails that read the journal instead of a file.
+backend = auto
+
+# Ban with nftables when present, otherwise iptables. Both variants block
+# every port, which is what you want for a host that has been probing you.
+banaction          = %(banaction_allports)s
+banaction_allports = nftables[type=allports]
+
+# Uncomment to get an e-mail per ban (needs a working MTA).
+# destemail = ops@example.com
+# sender    = fail2ban@example.com
+# action    = %(action_mwl)s

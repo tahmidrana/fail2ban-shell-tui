@@ -1,0 +1,28 @@
+# wordpress.local - WordPress login and XML-RPC brute force.
+# Works from the web server access log (combined format), so it needs no
+# plugin. Both nginx and Apache paths are listed; globs that match nothing
+# are skipped.
+
+# Repeated POST /wp-login.php that did NOT redirect (a failed login renders
+# the form again with HTTP 200; a success answers 302).
+[wordpress-login]
+enabled  = true
+port     = http,https
+filter   = f2b-wordpress-login
+logpath  = /var/log/nginx/*access.log
+           /var/log/apache2/*access.log
+maxretry = 5
+findtime = 10m
+bantime  = 6h
+
+# Any POST to xmlrpc.php. Disable this jail, or raise maxretry, if you use
+# Jetpack or the WordPress mobile app - both legitimately use XML-RPC.
+[wordpress-xmlrpc]
+enabled  = true
+port     = http,https
+filter   = f2b-wordpress-xmlrpc
+logpath  = /var/log/nginx/*access.log
+           /var/log/apache2/*access.log
+maxretry = 3
+findtime = 10m
+bantime  = 1d

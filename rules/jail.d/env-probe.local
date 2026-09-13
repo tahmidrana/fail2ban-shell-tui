@@ -1,0 +1,13 @@
+# env-probe.local - requests for secrets and debug files: .env and variants,
+# composer/npm lockfiles, phpinfo, backups, cloud credentials, and the common
+# PHP shell names scanners try after a successful upload.
+
+[env-probe]
+enabled  = true
+port     = http,https
+filter   = f2b-env-probe
+logpath  = /var/log/nginx/*access.log
+           /var/log/apache2/*access.log
+maxretry = 2
+findtime = 1d
+bantime  = 1d
