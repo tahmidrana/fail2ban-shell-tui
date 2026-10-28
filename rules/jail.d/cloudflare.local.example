@@ -1,0 +1,32 @@
+# cloudflare.local.example - extra bans for servers BEHIND Cloudflare.
+# Copy to /etc/fail2ban/jail.d/99-f2b-cloudflare.local on those servers only,
+# fill in the token and zone ID, and chmod 600 it. Do NOT install it on
+# servers clients reach directly: they are protected by the nftables ban alone.
+#
+# Prerequisite: the web server logs the real client IP (see
+# cloudflare/cloudflare-realip.conf). Without that, every ban would target a
+# Cloudflare address.
+
+[DEFAULT]
+# Cloudflare's own ranges must never be banned, whatever the logs say.
+# This REPLACES ignoreip from 00-f2b-defaults.local (it loads later), so keep
+# your office / VPN / monitoring addresses in this list too.
+ignoreip = 127.0.0.1/8 ::1 YOUR_OFFICE_IP
+           173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22
+           141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20
+           197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13
+           104.24.0.0/14 172.64.0.0/13 131.0.72.0/22
+           2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32
+           2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+
+# Every jail: local ban plus a ban at the Cloudflare edge.
+action = %(action_)s
+         f2b-cloudflare[cftoken="CHANGE_ME", cfzone="CHANGE_ME"]
+
+# SSH is not proxied by Cloudflare, so a Cloudflare rule would only waste
+# rule slots. Keep the plain local ban for these.
+[sshd]
+action = %(action_)s
+
+[recidive]
+action = %(action_)s

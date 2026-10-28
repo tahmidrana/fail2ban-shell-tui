@@ -22,6 +22,7 @@ Tested against fail2ban 1.0.2. Works on 0.10+.
 | `jail.d/env-probe.local` | `env-probe` | web access log | `.env*`, cloud credentials, `phpinfo`, config backups, webshells, dumps |
 | `jail.d/recidive.local` | `recidive` | fail2ban's own log | IPs banned 3 times in a day get two weeks |
 | `filter.d/f2b-*.conf` | - | - | The custom filters the jails above reference |
+| `cloudflare/`, `action.d/f2b-cloudflare.conf`, `jail.d/cloudflare.local.example` | - | - | Only for servers behind Cloudflare: realip, edge bans (see *Behind a proxy or CDN*) |
 | `samples/` | - | - | Log lines for testing the filters with `fail2ban-regex` |
 
 The stock filters that ship with fail2ban (`sshd`, `apache-*`, `nginx-*`,
@@ -245,20 +246,74 @@ journal on your host (`fail2ban-client get logtarget` says `SYSTEMD` or
 
 ## Behind a proxy or CDN
 
-If nginx or Apache sits behind Cloudflare, a load balancer or another
-reverse proxy, the access log shows the proxy's address and fail2ban would ban
-the proxy. Fix the log first, not fail2ban:
+Decide per server, because the two cases need opposite configuration.
 
-- **nginx**: enable `ngx_http_realip_module` with `set_real_ip_from <proxy
-  range>;` and `real_ip_header X-Forwarded-For;` (or `CF-Connecting-IP` for
-  Cloudflare). `$remote_addr` in the log then holds the real client.
-- **Apache**: enable `mod_remoteip` with `RemoteIPHeader X-Forwarded-For` and
-  `RemoteIPTrustedProxy <proxy range>`, and log `%a` instead of `%h`.
+| | Reached directly | Behind Cloudflare |
+|---|---|---|
+| IP in the access log | Real client | Cloudflare's, unless realip is configured |
+| Trust `CF-Connecting-IP`? | **No**, anyone can forge it | Yes, but only from Cloudflare's ranges |
+| Does an nftables ban stop web traffic? | Yes | **No**, packets come from Cloudflare |
+| Ban action for web jails | local (default) | local + `f2b-cloudflare` |
+| SSH jail | local | local (SSH is not proxied) |
+| Install from `rules/cloudflare/` | nothing | all of it |
 
-Also note that banning at the firewall only helps if the attacker connects to
-your host directly. Behind a CDN that terminates all traffic, pair fail2ban
-with a `cloudflare` or similar action, or rely on the CDN's own WAF for the
-web jails and keep fail2ban for SSH.
+Not sure which kind a server is? Compare `curl -sI https://example.com | grep -i
+^server` (Cloudflare answers `server: cloudflare`) and check whether the
+origin's own IP answers on 443 when you bypass DNS.
+
+### Servers not behind Cloudflare
+
+Nothing extra. Use the install steps above unchanged. Do **not** install the
+realip snippet or the Cloudflare action here.
+
+### Servers behind Cloudflare
+
+1. **Restore the real client IP in the log.** Fix the log, not fail2ban.
+
+   ```bash
+   sudo cp cloudflare/cloudflare-realip.conf /etc/nginx/conf.d/
+   sudo install -m 755 cloudflare/cloudflare-update-ips.sh /usr/local/sbin/
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+
+   The script regenerates the snippet from Cloudflare's published ranges;
+   run it weekly from cron, since the ranges change. Apache equivalent:
+   `mod_remoteip` with `RemoteIPHeader CF-Connecting-IP` and one
+   `RemoteIPTrustedProxy` per Cloudflare range, logging `%a` instead of `%h`.
+
+   Verify before enabling any ban: `sudo tail /var/log/nginx/access.log` must
+   show visitor addresses, not Cloudflare's (`104.x`, `172.64.x`, `162.158.x`...).
+
+2. **Ban at Cloudflare as well as locally.** A firewall ban on the origin
+   cannot block proxied traffic, so add the edge action:
+
+   ```bash
+   sudo cp action.d/f2b-cloudflare.conf /etc/fail2ban/action.d/
+   sudo cp jail.d/cloudflare.local.example /etc/fail2ban/jail.d/99-f2b-cloudflare.local
+   sudo chmod 600 /etc/fail2ban/jail.d/99-f2b-cloudflare.local
+   sudoedit /etc/fail2ban/jail.d/99-f2b-cloudflare.local   # token, zone ID, ignoreip
+   sudo fail2ban-client reload
+   ```
+
+   Needs `curl` and `jq`. Use an API token limited to *Zone > Firewall
+   Services > Edit* on that one zone. The drop-in also whitelists Cloudflare's
+   ranges, so a broken realip setup can never ban the edge and take the site
+   down. It keeps `sshd` and `recidive` on plain local bans.
+
+3. **Close the back door.** If the origin answers on 80/443 for anyone, an
+   attacker can skip Cloudflare and the edge bans do nothing. Allow 80/443
+   only from Cloudflare's ranges, or use Authenticated Origin Pulls or a
+   Cloudflare Tunnel.
+
+Things to know on these servers:
+
+- Cloudflare Access Rules never expire on their own. Unbans are sent when
+  fail2ban lifts a ban, but rules can go stale if fail2ban state is lost.
+  Plans have a rule limit, so keep `bantime.maxtime` reasonable.
+- Requests Cloudflare answers itself (cache hits, WAF blocks, challenges)
+  never reach the origin log, so the probe jails only see what got through.
+- Laravel: set trusted proxies to Cloudflare's ranges so `request()->ip()` is
+  the visitor. WordPress and `nginx-limit-req` depend on the real IP too.
 
 ## Testing a filter
 
@@ -309,7 +364,7 @@ Expected results on the samples:
 |---|---|---|
 | `Have not found any log file for X jail` | The `logpath` glob matched nothing | Expected if the service is not installed. Otherwise fix the path. |
 | Jail starts but never bans | Log format differs from *combined* | Run `fail2ban-regex` on the real log; adjust the regex or the web server log format. |
-| Bans hit your proxy or load balancer | Access log records the proxy IP | See *Behind a proxy or CDN*. |
+| Bans hit your proxy or load balancer | Access log records the proxy IP | See *Behind a proxy or CDN*. Make sure Cloudflare-fronted servers have realip set up and direct servers do not. |
 | `ERROR ... nftables ... not found` | Host uses iptables | Set `banaction_allports = iptables-allports` in the defaults file. |
 | Laravel jail never bans | Listener not registered, or `request()->ip()` returns the proxy | Check `storage/logs/laravel.log` for `Failed login` lines; configure trusted proxies. |
 | You locked yourself out | Your own IP was not in `ignoreip` | From another address: `sudo f2b unban <ip>` then `sudo f2b whitelist <ip>`. From console: `fail2ban-client set <jail> unbanip <ip>`. |
