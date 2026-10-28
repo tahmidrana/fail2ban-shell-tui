@@ -1,4 +1,4 @@
-# cloudflare.local.example - extra bans for servers BEHIND Cloudflare.
+# cloudflare.local - extra bans for servers BEHIND Cloudflare.
 # Copy to /etc/fail2ban/jail.d/99-f2b-cloudflare.local on those servers only,
 # fill in the token and zone ID, and chmod 600 it. Do NOT install it on
 # servers clients reach directly: they are protected by the nftables ban alone.

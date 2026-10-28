@@ -22,7 +22,7 @@ Tested against fail2ban 1.0.2. Works on 0.10+.
 | `jail.d/env-probe.local` | `env-probe` | web access log | `.env*`, cloud credentials, `phpinfo`, config backups, webshells, dumps |
 | `jail.d/recidive.local` | `recidive` | fail2ban's own log | IPs banned 3 times in a day get two weeks |
 | `filter.d/f2b-*.conf` | - | - | The custom filters the jails above reference |
-| `cloudflare/`, `action.d/f2b-cloudflare.conf`, `jail.d/cloudflare.local.example` | - | - | Only for servers behind Cloudflare: realip, edge bans (see *Behind a proxy or CDN*) |
+| `cloudflare/` (nginx and Apache snippets, updater), `action.d/f2b-cloudflare.conf`, `jail.d/cloudflare.local` | - | - | Only for servers behind Cloudflare: realip, edge bans (see *Behind a proxy or CDN*) |
 | `samples/` | - | - | Log lines for testing the filters with `fail2ban-regex` |
 
 The stock filters that ship with fail2ban (`sshd`, `apache-*`, `nginx-*`,
@@ -269,27 +269,57 @@ realip snippet or the Cloudflare action here.
 ### Servers behind Cloudflare
 
 1. **Restore the real client IP in the log.** Fix the log, not fail2ban.
+   Install the snippet for your web server:
+
+   nginx:
 
    ```bash
    sudo cp cloudflare/cloudflare-realip.conf /etc/nginx/conf.d/
-   sudo install -m 755 cloudflare/cloudflare-update-ips.sh /usr/local/sbin/
    sudo nginx -t && sudo systemctl reload nginx
    ```
 
-   The script regenerates the snippet from Cloudflare's published ranges;
-   run it weekly from cron, since the ranges change. Apache equivalent:
-   `mod_remoteip` with `RemoteIPHeader CF-Connecting-IP` and one
-   `RemoteIPTrustedProxy` per Cloudflare range, logging `%a` instead of `%h`.
+   Apache (Debian/Ubuntu; on RHEL copy to `/etc/httpd/conf.d/` instead):
 
-   Verify before enabling any ban: `sudo tail /var/log/nginx/access.log` must
-   show visitor addresses, not Cloudflare's (`104.x`, `172.64.x`, `162.158.x`...).
+   ```bash
+   sudo a2enmod remoteip
+   sudo cp cloudflare/cloudflare-remoteip.conf /etc/apache2/conf-available/
+   sudo a2enconf cloudflare-remoteip
+   sudo apachectl configtest && sudo systemctl reload apache2
+   ```
+
+   Then install the updater for your web server and run it weekly from cron.
+   It rewrites the snippet from Cloudflare's published ranges, tests the web
+   server config, rolls back if the test fails, and reloads only on success:
+
+   ```bash
+   # nginx
+   sudo install -m 755 cloudflare/cloudflare-update-ips-nginx.sh /usr/local/sbin/
+   echo '0 4 * * 1 root /usr/local/sbin/cloudflare-update-ips-nginx.sh' | sudo tee /etc/cron.d/cloudflare-ips
+
+   # Apache
+   sudo install -m 755 cloudflare/cloudflare-update-ips-apache.sh /usr/local/sbin/
+   echo '0 4 * * 1 root /usr/local/sbin/cloudflare-update-ips-apache.sh' | sudo tee /etc/cron.d/cloudflare-ips
+   ```
+
+   Apache gotchas:
+   - Debian ships `mods-enabled/remoteip.conf` with `RemoteIPHeader
+     X-Forwarded-For`. Remove or edit it so it does not conflict with
+     `CF-Connecting-IP`.
+   - Log the client with `%a` rather than `%h` in your `LogFormat`, so the
+     address is the one `mod_remoteip` resolved, not a hostname.
+   - `RemoteIPTrustedProxy` must list only Cloudflare's ranges. Trusting more
+     lets anyone forge the header.
+
+   Verify before enabling any ban: `sudo tail /var/log/nginx/access.log` (or
+   `/var/log/apache2/*access.log`) must show visitor addresses, not
+   Cloudflare's (`104.x`, `172.64.x`, `162.158.x`...).
 
 2. **Ban at Cloudflare as well as locally.** A firewall ban on the origin
    cannot block proxied traffic, so add the edge action:
 
    ```bash
    sudo cp action.d/f2b-cloudflare.conf /etc/fail2ban/action.d/
-   sudo cp jail.d/cloudflare.local.example /etc/fail2ban/jail.d/99-f2b-cloudflare.local
+   sudo cp jail.d/cloudflare.local /etc/fail2ban/jail.d/99-f2b-cloudflare.local
    sudo chmod 600 /etc/fail2ban/jail.d/99-f2b-cloudflare.local
    sudoedit /etc/fail2ban/jail.d/99-f2b-cloudflare.local   # token, zone ID, ignoreip
    sudo fail2ban-client reload
